@@ -1,0 +1,24 @@
+# 法律全文 — 不入库 (大, 18,374 部约 200MB)
+data/statutes/*.json
+data/index/*.jsonl
+data/index/*.json
+
+# 上游原始下载缓存
+data/sources/
+*.zip
+*.tar.gz
+*.parquet
+*.sqlite3
+*.db
+
+# 临时
+*.tmp
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
