@@ -1,0 +1,57 @@
+name: sync-single
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '单源同步 (laws-data / hf / lawrefbook)'
+        required: true
+        type: choice
+        options:
+          - laws-data
+          - hf
+          - lawrefbook
+
+jobs:
+  import-single:
+    name: import-${{ inputs.source }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Import source
+        env:
+          # W8.4 安全实践: 输入转 env 变量, 不直接嵌入 shell
+          SOURCE: ${{ inputs.source }}
+        run: |
+          mkdir -p data/sources logs
+          python3 scripts/import.py \
+            --source "${SOURCE}" \
+            --cache-dir data/sources \
+            2>&1 | tee "logs/import-${SOURCE}.log"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-single-${{ inputs.source }}-log
+          path: logs/import-${{ inputs.source }}.log
+          if-no-files-found: ignore
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ || true
+          if git diff --staged --quiet; then
+            echo "无变化"
+          else
+            git commit -m "sync-single(${{ inputs.source }}): ${{ github.run_id }}"
+            git push
+          fi

@@ -1,0 +1,149 @@
+name: sync-all
+
+on:
+  # 周级自动同步 (每周日 02:00 UTC+8, 即 18:00 UTC Saturday)
+  schedule:
+    - cron: '0 18 * * 0'
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '数据源 (all / laws-data / hf / lawrefbook / verify)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - laws-data
+          - hf
+          - lawrefbook
+          - verify
+      mode:
+        description: '运行模式 (parallel=并行多源 / serial=串行)'
+        required: false
+        default: 'parallel'
+        type: choice
+        options:
+          - parallel
+          - serial
+
+jobs:
+  # === 阶段 1: 多源并行导入 ===
+  # 3 个独立源同时跑, 互不依赖, 单个失败不影响其他
+  import:
+    name: import-${{ matrix.source }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # 单源失败不影响其他
+      matrix:
+        source: [Laws-data, hf, lawrefbook]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Cache pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Import ${{ matrix.source }}
+        continue-on-error: true  # 单源失败不阻塞
+        run: |
+          mkdir -p data/sources
+          python3 scripts/import.py \
+            --source ${{ matrix.source }} \
+            --cache-dir data/sources \
+            2>&1 | tee logs/import-${{ matrix.source }}.log
+
+      - name: Upload import logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-${{ matrix.source }}-log
+          path: logs/import-${{ matrix.source }}.log
+          if-no-files-found: ignore
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ || true
+          if git diff --staged --quiet; then
+            echo "无变化, 跳过提交"
+          else
+            git commit -m "sync(${{ matrix.source }}): ${{ github.run_id }}"
+            git push
+          fi
+
+  # === 阶段 2: 串行验证 + SQLite 构建 ===
+  # 必须等阶段 1 全部完成
+  build:
+    name: verify + sqlite build
+    needs: import
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify data integrity
+        continue-on-error: false
+        run: |
+          python3 scripts/verify.py 2>&1 | tee logs/verify.log
+
+      - name: Build SQLite database
+        continue-on-error: true  # SQLite 失败不阻塞 PR
+        run: |
+          python3 scripts/build_sqlite.py \
+            --output data/prc-law.db \
+            2>&1 | tee logs/sqlite-build.log
+
+      - name: Upload SQLite artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prc-law-db
+          path: data/prc-law.db
+          if-no-files-found: ignore
+          retention-days: 14  # 保留 14 天供下载
+
+      # SQLite 数据库不入库 (462MB, 太大)
+      # 律师本地用 scripts/build_sqlite.py 重新构建
+      - name: Verify SQLite
+        continue-on-error: true
+        run: |
+          python3 -c "
+          import sqlite3
+          conn = sqlite3.connect('data/prc-law.db')
+          cur = conn.execute('SELECT COUNT(*) FROM laws')
+          n_laws = cur.fetchone()[0]
+          cur = conn.execute('SELECT COUNT(*) FROM articles')
+          n_arts = cur.fetchone()[0]
+          print(f'✓ SQLite 验证: {n_laws} 部法律, {n_arts} 条法条')
+          conn.close()
+          " || echo "⚠ SQLite 验证失败"
+
+  # === 阶段 3: 健康检查 + 通知 ===
+  notify:
+    name: summary
+    needs: [import, build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## prc-law-data 同步总结" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- import 状态: ${{ needs.import.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- build 状态: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- run id: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

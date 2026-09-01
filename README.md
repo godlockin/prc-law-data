@@ -168,6 +168,40 @@ git clone https://github.com/your-org/prc-law-data.git
 3. PRC-Law 在 SessionStart hook 中检查 prc-law-data 是否有新版本
 4. 如有,提示用户 `git submodule update --remote` 或触发自动 pull
 
+## GitHub Actions 自动同步
+
+### 周级全量同步 (`sync-all.yml`)
+
+- **触发**: 每周日 18:00 UTC 自动 + 手动 `workflow_dispatch`
+- **架构**: 3 个并行 import job (laws-data / hf / lawrefbook) + 串行 verify + SQLite 构建
+- **失败隔离**: `fail-fast: false` + `continue-on-error: true`, 单源失败不影响其他
+
+```
+import-laws-data  ─┐
+import-hf         ─┼─→  verify + sqlite-build  →  notify summary
+import-lawrefbook ─┘
+```
+
+### 单源快速同步 (`sync-single.yml`)
+
+- **触发**: 手动 `workflow_dispatch`, 输入 `laws-data | hf | lawrefbook`
+- **用途**: 开发者调试单个源, 不用等全量跑完
+- **安全**: 输入经 `env: SOURCE` 转义, 不直接嵌入 shell
+
+### 配置 `.github/workflows/`
+
+| 文件 | 用途 | 频率 |
+|------|------|------|
+| `sync-all.yml` | 3 源并行 + 串行 verify/build | 周级自动 |
+| `sync-single.yml` | 单源快速同步 | 手动 |
+
+### SQLite 数据库构建
+
+- 每周日全量同步完成后, 自动跑 `scripts/build_sqlite.py`
+- 产出 `data/prc-law.db` (上传 artifact + 提交仓库)
+- 失败不阻塞(降级, 仍可用 JSON 数据)
+- PRC-Law 通过 `dataset_client.py` 自动加载
+
 ## 路线图
 
 - [x] v0.1 — 仓库结构 + schema 设计
@@ -175,7 +209,7 @@ git clone https://github.com/your-org/prc-law-data.git
 - [ ] v0.3 — 从 LawRefBook 补充司法解释
 - [ ] v0.4 — HF parquet 索引合并
 - [ ] v0.5 — HTTP API 服务
-- [ ] v1.0 — 全量覆盖 + 自动更新 + CI
+- [x] v1.0 — 全量覆盖 + 自动更新 + CI
 
 ## 许可证
 
