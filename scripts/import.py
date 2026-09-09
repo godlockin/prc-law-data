@@ -21,6 +21,8 @@ import.py — prc-law-data 数据导入器
 """
 from __future__ import annotations
 
+from data_store import content_hash, atomic_write, rebuild_indexes
+
 import argparse
 import hashlib
 import json
@@ -376,62 +378,62 @@ def import_lawrefbook(cache_dir: Path) -> Iterable[dict]:
 
 # === 标准化转换 ===
 def _parse_articles(content: str) -> dict[str, str]:
-    """从法律全文解析 '第X条 ... 第X+1条'. 忽略'第X章'/'第X节'/'第X编'
-    返回 { '577': '...', '一千二百六十': '...' }
-    keys 保留**原始**字符串 (用户/检索路由层做转换)
-    """
-    if not content:
-        return {}
-    arts = {}
-    pattern = re.compile(
-        r"第([一二三四五六七八九十百千零\d]+)条\s*(.*?)(?=(?:第[一二三四五六七八九十百千零\d]+条)|\Z)",
-        re.S,
-    )
-    for m in pattern.finditer(content):
-        num = m.group(1)
-        start = m.start()
-        ctx_before = content[max(0, start - 2):start]
-        if ctx_before.endswith(("章", "节", "编")):
-            continue
-        text = m.group(2).strip()
-        text = text[:2000]
-        if len(text) > 5:
-            arts[num] = text
-    return arts
+    """Parse line-start headings only; preserve full text and inserted articles."""
+    pattern = re.compile(r"(?m)^[ \t\u3000]*(?:#{1,6}[ \t]+)?第([一二三四五六七八九十百千零\d]+)条(?:之([一二三四五六七八九十百千零\d]+))?(?=[ \t\u3000\r\n]|$)[ \t\u3000]*")
+    headings = list(pattern.finditer(content))
+    articles = {}
+    for index, match in enumerate(headings):
+        key = match[1] + ("之" + match[2] if match[2] else "")
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+        text = content[match.end():end].strip()
+        lines = text.splitlines()
+        while lines and (not lines[-1].strip(" \t\u3000\u200b") or re.fullmatch(r"(?:#{1,6}\s*)?第[一二三四五六七八九十百千零\d]+(?:分编|编|章|节)\s*[^。；！？]*", lines[-1].strip())):
+            lines.pop()
+        text = "\n".join(lines).strip()
+        if key in articles:
+            raise ValueError(f"duplicate article heading: {key}; inspect upstream layout")
+        if not text:
+            raise ValueError(f"empty article: {key}")
+        articles[key] = text
+    return articles
+
+
+def _structured_articles(raw: dict) -> dict[str, str]:
+    """Prefer upstream article objects to avoid mixing chapter headings into text."""
+    articles = {}
+    heading = re.compile(r"^第([一二三四五六七八九十百千零\d]+)条(?:之([一二三四五六七八九十百千零\d]+))?")
+    def visit(node: dict) -> None:
+        for article in node.get("articles", []):
+            if not isinstance(article, dict):
+                raise ValueError("invalid structured article")
+            title = str(article.get("title", "")).strip()
+            match = heading.match(title)
+            if not match:
+                raise ValueError("invalid structured article title")
+            key = match[1] + ("之" + match[2] if match[2] else "")
+            text = str(article.get("content", "")).strip()
+            prefix = heading.match(text)
+            if prefix and prefix.group() == match.group():
+                parsed = _parse_articles(text)
+            else:
+                parsed = {key: text}
+            for number, body in parsed.items():
+                if number in articles or not body:
+                    raise ValueError(f"duplicate/empty structured article: {number}")
+                articles[number] = body
+        for name in ("parts", "chapters", "sections"):
+            for child in node.get(name, []):
+                visit(child)
+    visit(raw)
+    return articles
 
 
 _CN_DIGITS = "零一二三四五六七八九"
 _CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
 
 
-def _cn_to_int(cn: str) -> int | None:
-    """中文数字 → 阿拉伯数字.
-    支持: 一千二百六十 (1260), 五百七十七 (577), 十二 (12), 五 (5),
-          一百二十三 (123), 一千零五 (1005), 十 (10), 零 (0)
-    """
-    if not cn:
-        return None
-    if cn.isdigit():
-        return int(cn)
-    if cn == "十":
-        return 10
-    if all(c in _CN_DIGITS or c in _CN_UNITS for c in cn):
-        if "亿" in cn or "万" in cn:
-            return None  # 复杂先不处理
-        total = 0
-        current = 0
-        for c in cn:
-            if c in _CN_DIGITS:
-                current = _CN_DIGITS.index(c)
-            else:  # 十/百/千
-                unit = _CN_UNITS[c]
-                if current == 0:
-                    current = 1
-                total += current * unit
-                current = 0
-        total += current
-        return total
-    return None
+import common_bootstrap
+from law_common.rules import cn_to_int as _cn_to_int
 
 
 def normalize(raw: dict) -> dict | None:
@@ -447,13 +449,19 @@ def normalize(raw: dict) -> dict | None:
         content = r.get("full_text") or r.get("content") or r.get("正文") or r.get("全文") or ""
         if isinstance(content, list):
             content = "\n".join(str(c) for c in content)
-    articles = _parse_articles(content) if content else {}
+    upstream = raw.get("_raw", {})
+    articles = _structured_articles(upstream) if isinstance(upstream, dict) else {}
+    if not articles:
+        articles = _parse_articles(content) if content else {}
+    expected = raw.get("total_articles")
+    if expected and len(articles) < int(expected):
+        raise ValueError(f"article count differs from upstream: {len(articles)} != {expected}")
 
     law_type = raw.get("type") or "法律"
     office = raw.get("office", "")
     publish = raw.get("publish_date", "") or raw.get("_raw", {}).get("publish", "")
     effective = raw.get("effective_date", "") or raw.get("_raw", {}).get("valid_from", "")
-    status = raw.get("status", "现行有效")
+    status = raw.get("status", "unknown")
     if raw.get("is_current") is False:
         status = "已废止"
 
@@ -467,7 +475,10 @@ def normalize(raw: dict) -> dict | None:
         "office": office,
         "publish_date": str(publish)[:10] if publish else "",
         "effective_date": str(effective)[:10] if effective else "",
-        "status": status or "现行有效",
+        "status": status or "unknown",
+        "expiry_date": raw.get("expiry_date", ""),
+        "raw_content": content,
+        "parser_version": "2-line-headings",
         "source": {
             "upstream": "https://flk.npc.gov.cn",
             "via": raw["_source"],
@@ -480,11 +491,11 @@ def normalize(raw: dict) -> dict | None:
     # 标准化前: 把中文键转换为 int 键镜像 (加速客户端按阿拉伯查)
     int_articles = {}
     for cn_key, text in articles.items():
-        n = _cn_to_int(cn_key)
-        if n is not None and str(n) not in int_articles:
-            int_articles[str(n)] = text
+        parts = [_cn_to_int(part) for part in cn_key.split("之")]
+        if all(part is not None for part in parts):
+            int_articles["之".join(str(part) for part in parts)] = text
     data["articles_by_int"] = int_articles
-    data["content_hash"] = _content_hash(data)
+    data["content_hash"] = content_hash(data)
     return data
 
 
@@ -500,79 +511,33 @@ def main() -> int:
 
     cache_dir = Path(args.cache_dir)
     out_dir = Path(args.out_dir)
-    STATUTES_DIR.mkdir(parents=True, exist_ok=True)
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-
     sources = ["laws-data", "hf", "lawrefbook"] if args.source == "all" else [args.source]
-    fn_map = {
-        "laws-data": import_laws_data,
-        "hf": import_hf,
-        "lawrefbook": import_lawrefbook,
-    }
-
-    # 第一轮: 收集所有 (slug → raw) 去重
-    seen: dict[str, dict] = {}  # slug → first raw
-    sources_seen: dict[str, str] = {}  # slug → 来源标记
+    fn_map = {"laws-data": import_laws_data, "hf": import_hf, "lawrefbook": import_lawrefbook}
+    pending = {}
     for src in sources:
-        print(f"\n=== {src} ===")
         for raw in fn_map[src](cache_dir):
-            normalized = normalize(raw)
-            if not normalized:
+            data = normalize(raw)
+            if not data:
                 continue
-            slug = normalized["slug"]
-            # 优先保留 laws-data (结构化最好)
-            if slug not in seen or (src == "laws-data" and sources_seen.get(slug) != "laws-data"):
-                seen[slug] = normalized
-                sources_seen[slug] = src
-
-    # 第二轮: 写入
-    print(f"\n=== 写入 {len(seen)} 部法律 ===")
-    for slug, data in seen.items():
-        out_file = STATUTES_DIR / f"{slug}.json"
-        out_file.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                            encoding="utf-8")
-    print(f"  -> {STATUTES_DIR}/ ({len(seen)} files)")
-
-    # 第三轮: 写索引
-    index_path = INDEX_DIR / "laws.jsonl"
-    with index_path.open("w", encoding="utf-8") as f:
-        for slug, data in seen.items():
-            entry = {
-                "id": data["slug"],
-                "name": data["name"],
-                "short_name": data["short_name"],
-                "type": data["type"],
-                "article_count": data["article_count"],
-                "status": data["status"],
-                "source": data["source"]["via"],
-                "size_bytes": (STATUTES_DIR / f"{slug}.json").stat().st_size,
-                "updated_at": data["source"]["fetched_at"],
-            }
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"  -> {index_path}")
-
-    # slug map
-    slug_map_path = INDEX_DIR / "slug-map.json"
-    slug_map = {data["short_name"]: data["slug"] for data in seen.values()}
-    slug_map.update({data["name"]: data["slug"] for data in seen.values()})
-    slug_map_path.write_text(json.dumps(slug_map, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
-    print(f"  -> {slug_map_path} ({len(slug_map)} entries)")
-
-    # 法条反向索引 (双键: 中文 + 阿拉伯)
-    articles_index = INDEX_DIR / "articles.jsonl"
-    with articles_index.open("w", encoding="utf-8") as f:
-        for slug, data in seen.items():
-            for art_num in data["articles"]:
-                # 同时写阿拉伯键 (供 PRC-Law 检索路由)
-                int_num = _cn_to_int(art_num)
-                if int_num is not None:
-                    f.write(json.dumps({"law_slug": slug, "article_num": str(int_num),
-                                        "key_type": "int"}, ensure_ascii=False) + "\n")
-                # 保留原键 (中文)
-                f.write(json.dumps({"law_slug": slug, "article_num": art_num,
-                                    "key_type": "cn"}, ensure_ascii=False) + "\n")
-    print(f"  -> {articles_index}")
+            if not data["articles"]:
+                data["parsing_status"] = "unstructured_text" if data.get("raw_content") else "missing_source_text"
+            base = data["slug"]
+            # Preserve versions and conflicting texts; retrieval rejects ambiguous dates.
+            identity = json.dumps({"law": base, "effective": data["effective_date"],
+                                   "publish": data["publish_date"], "articles": data["articles"]},
+                                  sort_keys=True, ensure_ascii=False)
+            version = hashlib.sha256(identity.encode()).hexdigest()[:16]
+            slug = f"{base}--{version}"
+            data.update({"law_id": base, "version_id": version, "id": slug, "slug": slug})
+            data["content_hash"] = content_hash(data)
+            pending.setdefault(slug, data)
+    if not pending:
+        raise ValueError("empty import; existing dataset unchanged")
+    # Parsing must succeed for the entire batch before any output is changed.
+    for slug, data in pending.items():
+        atomic_write(out_dir / "statutes" / f"{slug}.json", json.dumps(data, ensure_ascii=False, indent=2))
+    count = rebuild_indexes(out_dir)
+    print(f"Imported {len(pending)} versions; indexed {count} files in {out_dir}")
 
     return 0
 

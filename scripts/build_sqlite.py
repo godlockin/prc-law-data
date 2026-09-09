@@ -24,6 +24,11 @@ import hashlib
 import json
 import sqlite3
 import sys
+import os
+import tempfile
+from contextlib import closing
+from data_store import dataset_fingerprint, content_hash
+from verify import verify
 from pathlib import Path
 from typing import Iterable
 
@@ -53,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_laws_status ON laws(status);
 -- 法条
 CREATE TABLE IF NOT EXISTS articles (
     law_id      TEXT NOT NULL,
-    article_num TEXT NOT NULL,           -- 阿拉伯数字字符串
+    article_num TEXT NOT NULL,           -- 原始条号，与 JSON 搜索保持一致
     content TEXT NOT NULL,
     hash TEXT NOT NULL,
     PRIMARY KEY (law_id, article_num),
@@ -64,7 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_articles_law ON articles(law_id);
 -- 全文搜索 (FTS5)
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
     article_num, content,
-    content='articles', content_rowid='rowid'
+    content='articles', content_rowid='rowid', tokenize='trigram case_sensitive 1'
 );
 
 -- 原始 JSON 路径 (W12 — SQLite + JSON 双层)
@@ -91,160 +96,60 @@ def _ensure_fts_sync(conn: sqlite3.Connection) -> None:
     )
 
 
-def build_sqlite(data_dir: Path, db_path: Path, verbose: bool = True) -> int:
-    """构建 SQLite 数据库
-
-    Returns:
-        写入 laws/articles 数 (元组)
-    """
-    statutes_dir = data_dir / "statutes"
-    index_path = data_dir / "index" / "laws.jsonl"
-
-    if not statutes_dir.exists():
-        print(f"❌ {statutes_dir} 不存在", file=sys.stderr)
-        sys.exit(2)
-
+def build_sqlite(data_dir: Path, db_path: Path, verbose: bool = True) -> tuple[int, int]:
+    """Strictly build a temporary DB, then atomically publish a verified generation."""
+    if verify(data_dir) != 0:
+        raise ValueError("dataset validation failed; existing database preserved")
+    fingerprint = dataset_fingerprint(data_dir)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    # 删除旧 db, 重建 (幂等)
-    if db_path.exists():
+    fd, name = tempfile.mkstemp(prefix=".law-build-", suffix=".db", dir=db_path.parent)
+    os.close(fd)
+    staged = Path(name)
+    try:
+        with closing(sqlite3.connect(staged)) as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(SCHEMA)
+            conn.execute("CREATE TABLE build_metadata (fingerprint TEXT NOT NULL, complete INTEGER NOT NULL)")
+            laws_count = arts_count = 0
+            for path in sorted((data_dir / "statutes").glob("*.json")):
+                data = json.loads(path.read_text())
+                if data.get("content_hash") != content_hash(data):
+                    raise ValueError(f"source changed during build: {path.name}")
+                if data.get("retrieval_status") == "quarantined":
+                    continue
+                slug = data["slug"]
+                source = data.get("source", {})
+                # Numeric aliases can collide on malformed upstream headings.
+                # Search the lossless primary map, exactly like the JSON fallback.
+                articles = data["articles"]
+                conn.execute("INSERT INTO laws VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (slug, slug, data["name"], data.get("type", ""), data.get("status", "unknown"),
+                              source.get("via", ""), source.get("url", ""), source.get("fetched_at", ""),
+                              source.get("updated_at", ""), len(articles)))
+                rows = [(slug, str(number), text, _sha256(text)) for number, text in articles.items()]
+                conn.executemany("INSERT INTO articles VALUES (?, ?, ?, ?)", rows)
+                conn.execute("INSERT INTO statutes_meta VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                             (slug, data["name"], f"statutes/{path.name}", path.stat().st_size, data["content_hash"]))
+                laws_count += 1
+                arts_count += len(rows)
+            _ensure_fts_sync(conn)
+            conn.execute("INSERT INTO articles_fts(articles_fts, rank) VALUES ('integrity-check', 1)")
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or conn.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("database integrity check failed")
+            if conn.execute("SELECT COUNT(*) FROM laws").fetchone()[0] != laws_count or conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0] != arts_count:
+                raise ValueError("database row count mismatch")
+            if dataset_fingerprint(data_dir) != fingerprint:
+                raise ValueError("dataset changed during build")
+            conn.execute("INSERT INTO build_metadata VALUES (?, 1)", (fingerprint,))
+            conn.commit()
+        with staged.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(staged, db_path)
         if verbose:
-            print(f"⚠ 删除旧 db: {db_path}")
-        db_path.unlink()
-
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript(SCHEMA)
-    # FTS5 external content sync triggers
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS articles_ai AFTER INSERT ON articles BEGIN
-            INSERT INTO articles_fts(rowid, article_num, content)
-            VALUES (new.rowid, new.article_num, new.content);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS articles_ad AFTER DELETE ON articles BEGIN
-            INSERT INTO articles_fts(articles_fts, rowid, article_num, content)
-            VALUES ('delete', old.rowid, old.article_num, old.content);
-        END
-    """)
-    conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS articles_au AFTER UPDATE ON articles BEGIN
-            INSERT INTO articles_fts(articles_fts, rowid, article_num, content)
-            VALUES ('delete', old.rowid, old.article_num, old.content);
-            INSERT INTO articles_fts(rowid, article_num, content)
-            VALUES (new.rowid, new.article_num, new.content);
-        END
-    """)
-
-    laws_count = 0
-    arts_count = 0
-
-    # 1. 优先从 laws.jsonl 索引读 (含 type/ status/ source 信息)
-    law_index: dict[str, dict] = {}
-    if index_path.exists():
-        for line in index_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                e = json.loads(line)
-                law_index[e["slug"]] = e
-            except Exception:
-                continue
-
-    # 2. 遍历 statutes/*.json
-    for path in sorted(statutes_dir.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠ 跳过 {path.name}: {e}", file=sys.stderr)
-            continue
-
-        slug = data.get("slug") or path.stem
-        name = data.get("name", slug)
-        articles_by_int = data.get("articles_by_int", {})
-        article_count = data.get("article_count", len(articles_by_int))
-        source = data.get("source", {})
-        idx_entry = law_index.get(slug, {})
-
-        law_id = idx_entry.get("id") or f"law-{slug}"
-
-        try:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO laws (
-                    id, slug, name, type, status,
-                    source_via, source_url, fetched_at, updated_at, article_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    law_id,
-                    slug,
-                    name,
-                    idx_entry.get("type") or data.get("type", "法律"),
-                    idx_entry.get("status") or data.get("status", "effective"),
-                    idx_entry.get("source_via") or source.get("via", ""),
-                    idx_entry.get("source_url") or source.get("url", ""),
-                    idx_entry.get("fetched_at") or source.get("fetched_at", ""),
-                    idx_entry.get("updated_at") or source.get("updated_at", ""),
-                    article_count,
-                ),
-            )
-            laws_count += 1
-        except sqlite3.IntegrityError as e:
-            if verbose:
-                print(f"  ⚠ law 插入失败 {slug}: {e}", file=sys.stderr)
-            continue
-
-        # 3. 插入 articles (批量)
-        rows = []
-        for art_num, text in articles_by_int.items():
-            rows.append((
-                law_id,
-                str(art_num),
-                text,
-                _sha256(text),
-            ))
-        try:
-            conn.executemany(
-                "INSERT OR REPLACE INTO articles (law_id, article_num, content, hash) "
-                "VALUES (?, ?, ?, ?)",
-                rows,
-            )
-            arts_count += len(rows)
-        except sqlite3.IntegrityError as e:
-            if verbose:
-                print(f"  ⚠ articles 插入失败 {slug}: {e}", file=sys.stderr)
-
-        # 4. statutes_meta
-        size = path.stat().st_size
-        meta_hash = _sha256(path.read_text(encoding="utf-8"))
-        conn.execute(
-                    """
-                    INSERT OR REPLACE INTO statutes_meta (
-                        slug, name, json_path, size_bytes, content_hash, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, datetime('now'))
-                    """,
-                    (slug, name, f"statutes/{path.name}", size, meta_hash),
-                )
-
-    conn.commit()
-
-    # 5. 健康检查
-    cur = conn.execute("SELECT COUNT(*) FROM laws")
-    n_laws = cur.fetchone()[0]
-    cur = conn.execute("SELECT COUNT(*) FROM articles")
-    n_arts = cur.fetchone()[0]
-    cur = conn.execute("SELECT COUNT(*) FROM articles_fts")
-    n_fts = cur.fetchone()[0]
-
-    if verbose:
-        print(f"✅ SQLite 构建完成: {db_path}")
-        print(f"   laws: {n_laws}")
-        print(f"   articles: {n_arts}")
-        print(f"   articles_fts: {n_fts}")
-
-    conn.close()
-    return n_laws, n_arts
+            print(json.dumps({"event": "database_published", "laws": laws_count, "articles": arts_count}))
+        return laws_count, arts_count
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def verify_db(db_path: Path) -> bool:
@@ -280,14 +185,14 @@ def main():
         description="prc-law-data SQLite 构建器 (W12)")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA),
                         help="data 目录 (默认 ./data)")
-    parser.add_argument("-o", "--output", default=str(DEFAULT_DB),
+    parser.add_argument("-o", "--output", default=None,
                         help="输出 db 路径 (默认 data/prc-law.db)")
     parser.add_argument("--verify", action="store_true",
                         help="构建后跑完整性校验")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    db_path = Path(args.output)
+    db_path = Path(args.output) if args.output else data_dir / "prc-law.db"
 
     n_laws, n_arts = build_sqlite(data_dir, db_path)
 

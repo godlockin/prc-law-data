@@ -5,10 +5,12 @@
 
 ## 设计目标
 
+2026-09-09：新增[数据校验与安全修复](docs/safety-fixes-2026-09-09.md)、[搜索构建与发布](docs/search-publication-upgrade-2026-09-09.md)、[内部服务运维](docs/internal-service-operations.md)及[共享规则与官方核验](docs/common-and-official-controls.md)。当前为内部辅助检索数据服务；来源可访问、结构完整和法律现行效力是不同的验证事项。
+
 - **独立性**: 与 PRC-Law 仓库无强制绑定,通过 HTTP / 本地路径 / git submodule 三种模式对接
-- **可演进**: 数据集更新节奏独立 (新法出台即拉),不受 PRC-Law 技能库发布周期约束
+- **可演进**: 数据集更新与技能库发布解耦；提供显式更新及复核工具，不承诺新法自动即时入库
 - **按需加载**: 不预下载,首次检索时按 `slug` 拉取单部法律全文 (zip/json)
-- **零成本**: 全部数据来自公开 GitHub / HuggingFace / 政府源,无商业 credit 依赖
+- **成本边界**: 离线公开数据检索不调用商业credit接口；网络、存储、算力和人工仍有成本，来源再分发权限须分别核实
 
 ## 数据来源
 

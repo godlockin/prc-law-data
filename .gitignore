@@ -2,6 +2,7 @@
 data/statutes/*.json
 data/index/*.jsonl
 data/index/*.json
+data/recovery-report.json
 
 # 上游原始下载缓存
 data/sources/
